@@ -1,0 +1,102 @@
+'use strict';
+(() => {
+  const statuses = ['Pendiente','En investigación','En prueba','Para compartir','Finalizado'];
+  const cfg = window.APP_CONFIG || {};
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const formatDate = v => v ? new Date(`${v}T12:00:00`).toLocaleDateString('es-AR') : 'Sin definir';
+  const slug = s => String(s || '').toLowerCase().replaceAll(' ','-');
+  let client, session, items = [], current = null, urls = [], channel;
+
+  function toast(msg) { $('toast').textContent=msg; $('toast').classList.add('show'); setTimeout(()=>$('toast').classList.remove('show'),2600); }
+  function showError(el,msg) { el.textContent=msg; el.style.display='block'; }
+  function clearError(el) { el.textContent=''; el.style.display='none'; }
+  function close(id) { $(id).classList.remove('show'); if(id==='detailOverlay'){current=null;revokeUrls();} }
+  function revokeUrls() { urls.forEach(URL.revokeObjectURL); urls=[]; }
+  function setBusy(button,busy,label) { button.disabled=busy; if(label)button.textContent=busy?'Conectando…':label; }
+
+  async function loadBoard() {
+    const {data:requests,error:rErr}=await client.from('requests').select('*').order('created_at',{ascending:false});
+    if(rErr)throw rErr;
+    const ids=(requests||[]).map(r=>r.id);
+    let updates=[];
+    if(ids.length){const {data,error}=await client.from('request_updates').select('*').in('request_id',ids).order('created_at',{ascending:true});if(error)throw error;updates=data||[];}
+    items=(requests||[]).map(r=>({id:r.id,title:r.title,type:r.type||'Pedido',status:r.status||'Pendiente',owner:r.owner||'Equipo de Soporte',requestDate:r.request_date||'',dueDate:r.due_date||'',description:r.description||'',next:r.next_step||'',created:r.created_at,updates:updates.filter(u=>u.request_id===r.id).map(u=>({id:u.id,text:u.text,next:u.next_step||'',by:u.by_name||u.by_email||'Equipo',date:u.created_at}))}));
+    if(current)current=items.find(i=>i.id===current.id)||null;
+    render();
+  }
+  function render() {
+    const q=$('search').value.toLowerCase();
+    const shown=items.filter(x=>(x.title+' '+x.owner+' '+x.description).toLowerCase().includes(q));
+    $('cards').innerHTML=shown.length?shown.map(x=>{const last=x.updates.at(-1);return `<article class="card" data-id="${esc(x.id)}"><div class="cardtop"><h3>${esc(x.title)}</h3><span class="badge ${slug(x.status)}">${esc(x.status)}</span></div><p class="summary">${esc(last?last.text:x.description||'Todavía no se agregó un resumen.')}</p><div class="cardmeta"><span>Entrega: <strong>${formatDate(x.dueDate)}</strong></span><span>${x.updates.length} avance${x.updates.length===1?'':'s'}</span></div></article>`}).join(''):'<div class="empty">No encontramos pedidos con ese texto.</div>';
+    $('openCount').textContent=items.filter(x=>x.status!=='Finalizado').length;
+    $('workCount').textContent=items.filter(x=>['En investigación','En prueba','Para compartir'].includes(x.status)).length;
+    $('doneCount').textContent=items.filter(x=>x.status==='Finalizado').length;
+    $('countLabel').textContent=`${shown.length} pedido${shown.length===1?'':'s'}`;
+  }
+  async function renderEvidence(id) {
+    const target=$('evidenceList');
+    try {
+      const {data:files,error}=await client.from('request_attachments').select('*').eq('request_id',id).order('created_at',{ascending:false});
+      if(error)throw error;
+      if(!current||current.id!==id)return;
+      if(!files.length){target.innerHTML='<div class="detailstate">Todavía no hay archivos adjuntos.</div>';return;}
+      const cards=[];
+      for(const f of files){const {data,error:urlError}=await client.storage.from('pedido-adjuntos').createSignedUrl(f.storage_path,3600);if(urlError)throw urlError;const url=data.signedUrl;const media=f.mime_type?.startsWith('image/')?`<img src="${url}" alt="${esc(f.name)}">`:f.mime_type?.startsWith('video/')?`<video src="${url}" controls></video>`:'<div class="detailstate">Archivo adjunto</div>';cards.push(`<div class="evidence-card">${media}<a href="${url}" target="_blank" rel="noopener" download="${esc(f.name)}">${esc(f.name)}</a><small>${new Date(f.created_at).toLocaleDateString('es-AR')} · <button class="linkbutton" data-file-delete="${esc(f.id)}" type="button">Quitar</button></small></div>`);}
+      target.innerHTML=cards.join('');
+      target.querySelectorAll('[data-file-delete]').forEach(b=>b.onclick=async()=>{try{await removeFile(b.dataset.fileDelete,id);await renderEvidence(id);toast('Adjunto quitado');}catch(e){toast(`No se pudo quitar: ${e.message}`);}});
+    } catch(e) { target.innerHTML=`<div class="detailstate">No se pudieron cargar los adjuntos: ${esc(e.message)}</div>`; }
+  }
+  async function removeFile(fileId,requestId) {
+    const {data:file,error}=await client.from('request_attachments').select('storage_path').eq('id',fileId).single();if(error)throw error;
+    const {error:storageError}=await client.storage.from('pedido-adjuntos').remove([file.storage_path]);if(storageError)throw storageError;
+    const {error:rowError}=await client.from('request_attachments').delete().eq('id',fileId);if(rowError)throw rowError;
+    revokeUrls();await renderEvidence(requestId);
+  }
+  async function show(id) {
+    revokeUrls();current=items.find(x=>x.id===id);if(!current)return;const x=current;
+    $('detailType').textContent='PEDIDO · '+(x.owner||'Equipo de Soporte');$('detailTitle').textContent=x.title;
+    $('detailBody').innerHTML=`<div class="detailstatus"><span class="detailstate">Estado</span><select id="stateSelect">${statuses.map(s=>`<option ${s===x.status?'selected':''}>${s}</option>`).join('')}</select></div><div class="eyebrow">EDITAR DATOS DEL PEDIDO</div><div class="formgrid"><div class="field full"><label for="editTitle">Título</label><input id="editTitle" maxlength="110" value="${esc(x.title)}"></div><div class="field full"><label for="editDescription">Resumen del pedido</label><textarea id="editDescription">${esc(x.description)}</textarea></div><div class="field"><label for="editRequestDate">Fecha del pedido</label><input id="editRequestDate" type="date" value="${esc(x.requestDate)}"></div><div class="field"><label for="editDueDate">Fecha de entrega</label><input id="editDueDate" type="date" value="${esc(x.dueDate)}"></div></div><div style="margin-top:13px"><button class="btn primary" id="saveDetails" style="width:100%;padding:11px;font-size:14px">Guardar cambios</button></div>${x.next?`<div class="nextstep"><div class="detailitem">Próximo paso<strong>${esc(x.next)}</strong></div></div>`:''}<div class="advancebox"><h3>¿Qué avance hubo?</h3><textarea id="advanceText" placeholder="Escribí una novedad breve…"></textarea><input id="advanceNext" placeholder="Próximo paso (opcional)"><button class="btn primary" id="saveAdvance">Registrar avance</button></div><div class="evidence"><h3>Capturas y videos</h3><div class="filepick"><input id="evidenceInput" type="file" accept="image/*,video/*" multiple><span class="detailstate">Adjuntos compartidos con el equipo.</span></div><div class="evidence-list" id="evidenceList">Cargando adjuntos…</div></div><div class="history"><h3>Avances anteriores</h3>${x.updates.length?[...x.updates].reverse().map(u=>`<div class="history-entry"><div class="date">${new Date(u.date).toLocaleDateString('es-AR')} · ${esc(u.by||x.owner)}</div><div class="entrytext">${esc(u.text)}</div><button class="edit-comment" type="button" data-edit-comment="${esc(u.id)}">Editar comentario</button>${u.next?`<div class="entrytext"><strong>Próximo paso:</strong> ${esc(u.next)}</div>`:''}</div>`).join(''):'<div class="detailstate">Todavía no hay avances.</div>'}</div><div class="modalactions"><span class="detailstate">Los cambios se comparten con el equipo.</span><button id="deleteBtn" class="btn small">Eliminar pedido</button></div>`;
+    $('detailOverlay').classList.add('show');await renderEvidence(id);
+    $('detailBody').querySelectorAll('[data-edit-comment]').forEach(b=>b.onclick=async()=>{const u=x.updates.find(a=>a.id===b.dataset.editComment);if(!u)return;const edited=prompt('Editar comentario:',u.text);if(edited===null)return;if(!edited.trim()){toast('El comentario no puede quedar vacío');return;}const {error}=await client.from('request_updates').update({text:edited.trim()}).eq('id',u.id);if(error){toast(`No se guardó: ${error.message}`);return;}await loadBoard();await show(id);toast('Comentario actualizado');});
+    $('stateSelect').onchange=async e=>{const {error}=await client.from('requests').update({status:e.target.value}).eq('id',id);if(error){toast(`No se guardó: ${error.message}`);return;}await loadBoard();await show(id);toast('Estado actualizado');};
+    $('saveDetails').onclick=async()=>{const title=$('editTitle').value.trim();if(!title){toast('El título no puede quedar vacío');return;}const patch={title,description:$('editDescription').value.trim(),request_date:$('editRequestDate').value||null,due_date:$('editDueDate').value||null};const {error}=await client.from('requests').update(patch).eq('id',id);if(error){toast(`No se guardó: ${error.message}`);return;}await loadBoard();await show(id);toast('Cambios guardados');};
+    $('saveAdvance').onclick=async()=>{const text=$('advanceText').value.trim();if(!text){toast('Escribí el avance antes de guardarlo');return;}const next=$('advanceNext').value.trim();const {error}=await client.from('request_updates').insert({request_id:id,text,next_step:next||null,by_name:session.user.user_metadata?.full_name||session.user.email,by_email:session.user.email});if(error){toast(`No se guardó: ${error.message}`);return;}const patch={};if(next)patch.next_step=next;if(x.status==='Pendiente')patch.status='En investigación';if(Object.keys(patch).length){const {error:e2}=await client.from('requests').update(patch).eq('id',id);if(e2){toast(`El avance quedó guardado, pero no se actualizó el pedido: ${e2.message}`);return;}}await loadBoard();await show(id);toast('Avance registrado para todo el equipo');};
+    $('evidenceInput').onchange=async e=>{const files=[...e.target.files];if(!files.length)return;for(const file of files){if(!(file.type.startsWith('image/')||file.type.startsWith('video/')))continue;const fileId=crypto.randomUUID();const path=`${id}/${fileId}-${file.name.replace(/[^\w.\- ]/g,'_')}`;const {error:upError}=await client.storage.from('pedido-adjuntos').upload(path,file,{contentType:file.type,upsert:false});if(upError){toast(`No se pudo subir ${file.name}: ${upError.message}`);continue;}const {error:metaError}=await client.from('request_attachments').insert({id:fileId,request_id:id,name:file.name,mime_type:file.type,storage_path:path,uploaded_by:session.user.id});if(metaError){await client.storage.from('pedido-adjuntos').remove([path]);toast(`No se guardó el adjunto: ${metaError.message}`);continue;}}revokeUrls();await renderEvidence(id);e.target.value='';toast('Adjuntos compartidos con el equipo');};
+    $('deleteBtn').onclick=async()=>{if(!confirm('¿Querés eliminar este pedido y sus avances para todo el equipo?'))return;const {data:files}=await client.from('request_attachments').select('storage_path').eq('request_id',id);if(files?.length)await client.storage.from('pedido-adjuntos').remove(files.map(f=>f.storage_path));const {error}=await client.from('requests').delete().eq('id',id);if(error){toast(`No se pudo eliminar: ${error.message}`);return;}close('detailOverlay');await loadBoard();toast('Pedido eliminado para todo el equipo');};
+  }
+  async function exportBackup() {
+    const {data:requests,error}=await client.from('requests').select('*').order('created_at');if(error)throw error;const ids=requests.map(r=>r.id);let updates=[];let attachments=[];
+    if(ids.length){const [u,a]=await Promise.all([client.from('request_updates').select('*').in('request_id',ids).order('created_at'),client.from('request_attachments').select('*').in('request_id',ids)]);if(u.error)throw u.error;if(a.error)throw a.error;updates=u.data;attachments=a.data;}
+    const itemsOut=requests.map(r=>({...r,requestDate:r.request_date,dueDate:r.due_date,next:r.next_step,updates:updates.filter(u=>u.request_id===r.id).map(u=>({id:u.id,text:u.text,next:u.next_step,by:u.by_name||u.by_email,date:u.created_at})),attachments:attachments.filter(a=>a.request_id===r.id).map(a=>({name:a.name,mime_type:a.mime_type,storage_path:a.storage_path}))}));
+    const blob=new Blob([JSON.stringify({format:'gauss-shared-board-v1',exportedAt:new Date().toISOString(),items:itemsOut},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`respaldo-pedidos-${new Date().toISOString().slice(0,10)}.json`;a.click();URL.revokeObjectURL(a.href);toast('Respaldo descargado (registros y referencias a adjuntos)');
+  }
+  async function importBackup(file) {
+    const parsed=JSON.parse(await file.text());if(!Array.isArray(parsed.items))throw new Error('El archivo no contiene una lista de pedidos válida.');
+    const rows=parsed.items.map(x=>({id:String(x.id||crypto.randomUUID()),title:String(x.title||'Pedido importado'),type:x.type||'Pedido',status:statuses.includes(x.status)?x.status:'Pendiente',owner:x.owner||'Equipo de Soporte',request_date:x.request_date||x.requestDate||null,due_date:x.due_date||x.dueDate||null,description:x.description||'',next_step:x.next_step||x.next||null,created_by:session.user.id}));
+    const {error}=await client.from('requests').upsert(rows);if(error)throw error;
+    const updates=[];for(const x of parsed.items){for(let i=0;i<(x.updates||[]).length;i++){const u=x.updates[i];updates.push({id:String(u.id||`${x.id}-${u.date||'sinfecha'}-${i}`),request_id:String(x.id),text:u.text||'',next_step:u.next||null,by_name:u.by||null,by_email:session.user.email,created_by:session.user.id,created_at:u.date||new Date().toISOString()});}}
+    if(updates.length){const {error:updateError}=await client.from('request_updates').upsert(updates);if(updateError)throw updateError;}
+    await loadBoard();toast('Respaldo importado. Los archivos adjuntos requieren subirse nuevamente.');
+  }
+  function setLoggedIn(user) {$('authGate').hidden=true;$('appShell').hidden=false;$('userEmail').textContent=user.email||'Usuario';$('userAvatar').textContent=(user.email||'EQ').slice(0,2).toUpperCase();}
+  function setLoggedOut() {$('appShell').hidden=true;$('authGate').hidden=false;}
+  async function start() {
+    if(!cfg.supabaseUrl||cfg.supabaseUrl.includes('PEGAR_')||!cfg.supabasePublishableKey||cfg.supabasePublishableKey.includes('PEGAR_')){showError($('loginError'),'Falta conectar el proyecto de datos. El administrador debe completar config.js y ejecutar schema.sql.');$('loginForm').querySelector('button').disabled=true;return;}
+    client=window.supabase.createClient(cfg.supabaseUrl,cfg.supabasePublishableKey);
+    $('loginForm').onsubmit=async e=>{e.preventDefault();const b=e.currentTarget.querySelector('button');setBusy(b,true);clearError($('loginError'));const {error}=await client.auth.signInWithPassword({email:$('loginEmail').value.trim(),password:$('loginPassword').value});setBusy(b,false,'Ingresar');if(error)showError($('loginError'),'No se pudo ingresar. Revisá el correo y la contraseña o pedí una invitación al administrador.');};
+    $('signOutBtn').onclick=async()=>{await client.auth.signOut();};
+    $('backupBtn').onclick=async()=>{try{await exportBackup();}catch(e){toast(`No se pudo exportar: ${e.message}`);}};
+    $('importBtn').onclick=()=>$('importFile').click();
+    $('importFile').onchange=async e=>{if(!e.target.files?.[0])return;try{await importBackup(e.target.files[0]);}catch(err){toast(`No se pudo importar: ${err.message}`);}e.target.value='';};
+    client.auth.onAuthStateChange(async(_event,newSession)=>{session=newSession;if(!session){setLoggedOut();return;}setLoggedIn(session.user);try{await loadBoard();if(channel)await client.removeChannel(channel);channel=client.channel('gauss-board-live').on('postgres_changes',{event:'*',schema:'public',table:'requests'},()=>loadBoard()).on('postgres_changes',{event:'*',schema:'public',table:'request_updates'},()=>loadBoard()).subscribe();}catch(e){toast(`No se pudo cargar el tablero: ${e.message}`);}});
+    const {data:{session:existing}}=await client.auth.getSession();if(existing){session=existing;setLoggedIn(session.user);try{await loadBoard();channel=client.channel('gauss-board-live').on('postgres_changes',{event:'*',schema:'public',table:'requests'},()=>loadBoard()).on('postgres_changes',{event:'*',schema:'public',table:'request_updates'},()=>loadBoard()).subscribe();}catch(e){toast(`No se pudo cargar el tablero: ${e.message}`);}}
+    $('newBtn').onclick=()=>{$('requestDate').value=new Date().toISOString().slice(0,10);$('formOverlay').classList.add('show');};
+    document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>close(b.dataset.close));document.querySelectorAll('.overlay').forEach(o=>o.onclick=e=>{if(e.target===o)close(o.id);});
+    $('cards').onclick=e=>{const c=e.target.closest('[data-id]');if(c)show(c.dataset.id);};$('search').oninput=render;
+    $('requestForm').onsubmit=async e=>{e.preventDefault();const row={id:crypto.randomUUID(),title:$('title').value.trim(),type:'Pedido',status:'Pendiente',owner:$('owner').value.trim()||'Equipo de Soporte',request_date:$('requestDate').value||null,due_date:$('dueDate').value||null,description:$('description').value.trim(),next_step:$('next').value.trim()||null,created_by:session.user.id};const {error}=await client.from('requests').insert(row);if(error){toast(`No se pudo guardar: ${error.message}`);return;}await loadBoard();$('requestForm').reset();$('owner').value='Equipo de Soporte';close('formOverlay');toast('Pedido compartido con el equipo');};
+    document.onkeydown=e=>{if(e.key==='Escape'){close('formOverlay');close('detailOverlay');}};
+  }
+  start();
+})();
+
