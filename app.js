@@ -6,7 +6,9 @@
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const formatDate = v => v ? new Date(`${v}T12:00:00`).toLocaleDateString('es-AR') : 'Sin definir';
   const slug = s => String(s || '').toLowerCase().replaceAll(' ','-');
-  let client, session, items = [], current = null, urls = [], channel;
+  let client, session, items = [], current = null, urls = [], channel, accessChannel;
+  const ownerEmail = String(cfg.ownerEmail || '').toLowerCase();
+  let passwordSetupMode = ['invite','recovery'].includes(new URLSearchParams(location.hash.slice(1)).get('type'));
 
   function toast(msg) { $('toast').textContent=msg; $('toast').classList.add('show'); setTimeout(()=>$('toast').classList.remove('show'),2600); }
   function showError(el,msg) { el.textContent=msg; el.style.display='block'; }
@@ -81,16 +83,48 @@
   }
   function setLoggedIn(user) {$('authGate').hidden=true;$('appShell').hidden=false;$('userEmail').textContent=user.email||'Usuario';$('userAvatar').textContent=(user.email||'EQ').slice(0,2).toUpperCase();}
   function setLoggedOut() {$('appShell').hidden=true;$('authGate').hidden=false;}
+  function showPasswordSetup(message='Creá una contraseña personal para ingresar al tablero.') {$('authTitle').textContent='Crear contraseña';$('authDescription').textContent=message;$('loginForm').hidden=true;$('resetPasswordBtn').hidden=true;$('authHint').hidden=true;$('passwordSetupForm').hidden=false;clearError($('passwordError'));}
+  function showLogin() {$('authTitle').textContent='Ingresar al tablero';$('authDescription').textContent='Usá el correo y tu contraseña personal.';$('loginForm').hidden=false;$('resetPasswordBtn').hidden=false;$('authHint').hidden=false;$('passwordSetupForm').hidden=true;}
+  function addAccessNotice(row) {
+    const box=$('accessNotice');box.hidden=false;
+    const line=document.createElement('div');line.className='access-notice-row';
+    const message=document.createElement('span');message.textContent=`${row.email} creó su contraseña y ya puede ingresar.`;
+    const dismiss=document.createElement('button');dismiss.type='button';dismiss.className='btn small';dismiss.textContent='Entendido';
+    dismiss.onclick=async()=>{const {error}=await client.from('account_setup_events').update({read_at:new Date().toISOString()}).eq('user_id',row.user_id);if(error){toast(`No se pudo cerrar el aviso: ${error.message}`);return;}line.remove();if(!box.children.length)box.hidden=true;};
+    line.append(message,dismiss);box.append(line);
+  }
+  async function loadAccessNotices() {
+    if((session?.user?.email||'').toLowerCase()!==ownerEmail)return;
+    const {data,error}=await client.from('account_setup_events').select('user_id,email,created_at').is('read_at',null).order('created_at',{ascending:false});
+    if(error){toast(`No se pudieron revisar los avisos: ${error.message}`);return;}
+    $('accessNotice').replaceChildren();(data||[]).forEach(addAccessNotice);$('accessNotice').hidden=!(data||[]).length;
+  }
+  async function startBoard(user) {
+    setLoggedIn(user);
+    try {
+      await loadBoard();
+      if(channel)await client.removeChannel(channel);
+      channel=client.channel('gauss-board-live').on('postgres_changes',{event:'*',schema:'public',table:'requests'},()=>loadBoard()).on('postgres_changes',{event:'*',schema:'public',table:'request_updates'},()=>loadBoard()).subscribe();
+      if((user.email||'').toLowerCase()===ownerEmail){
+        await loadAccessNotices();
+        if(accessChannel)await client.removeChannel(accessChannel);
+        accessChannel=client.channel('gauss-account-setup-live').on('postgres_changes',{event:'INSERT',schema:'public',table:'account_setup_events'},payload=>{if(payload.new.email?.toLowerCase()!==ownerEmail)addAccessNotice(payload.new);}).subscribe();
+      }
+    } catch(e) { toast(`No se pudo cargar el tablero: ${e.message}`); }
+  }
   async function start() {
     if(!cfg.supabaseUrl||cfg.supabaseUrl.includes('PEGAR_')||!cfg.supabasePublishableKey||cfg.supabasePublishableKey.includes('PEGAR_')){showError($('loginError'),'Falta conectar el proyecto de datos. El administrador debe completar config.js y ejecutar schema.sql.');$('loginForm').querySelector('button').disabled=true;return;}
     client=window.supabase.createClient(cfg.supabaseUrl,cfg.supabasePublishableKey);
-    $('loginForm').onsubmit=async e=>{e.preventDefault();const b=e.currentTarget.querySelector('button');setBusy(b,true);clearError($('loginError'));const {error}=await client.auth.signInWithPassword({email:$('loginEmail').value.trim(),password:$('loginPassword').value});setBusy(b,false,'Ingresar');if(error)showError($('loginError'),'No se pudo ingresar. Revisá el correo y la contraseña o pedí una invitación al administrador.');};
+    $('loginForm').onsubmit=async e=>{e.preventDefault();const b=e.currentTarget.querySelector('button');setBusy(b,true);clearError($('loginError'));const {error}=await client.auth.signInWithPassword({email:$('loginEmail').value.trim(),password:$('loginPassword').value});setBusy(b,false,'Ingresar');if(error)showError($('loginError'),'No se pudo ingresar. Revisá el correo y la contraseña, o usá “Crear o recuperar mi contraseña”.');};
+    $('resetPasswordBtn').onclick=async()=>{const email=$('loginEmail').value.trim();if(!email){showError($('loginError'),'Escribí tu correo para enviarte un enlace para crear o recuperar tu contraseña.');$('loginEmail').focus();return;}clearError($('loginError'));const b=$('resetPasswordBtn');b.disabled=true;const {error}=await client.auth.resetPasswordForEmail(email,{redirectTo:location.origin+location.pathname});b.disabled=false;if(error)showError($('loginError'),`No se pudo enviar el enlace: ${error.message}`);else toast('Te enviamos un enlace al correo ingresado. Revisá también el spam.');};
+    $('passwordSetupForm').onsubmit=async e=>{e.preventDefault();const b=e.currentTarget.querySelector('button');const password=$('newPassword').value;clearError($('passwordError'));if(password.length<8){showError($('passwordError'),'Usá una contraseña de al menos 8 caracteres.');return;}if(password!==$('confirmPassword').value){showError($('passwordError'),'Las contraseñas no coinciden.');return;}setBusy(b,true,'Guardar contraseña');const {error}=await client.auth.updateUser({password});setBusy(b,false,'Guardar contraseña');if(error){showError($('passwordError'),`No se pudo guardar: ${error.message}`);return;}if((session?.user?.email||'').toLowerCase()!==ownerEmail){const {error:noticeError}=await client.from('account_setup_events').insert({user_id:session.user.id,email:session.user.email});if(noticeError&&noticeError.code!=='23505')toast('La contraseña se guardó, pero no se pudo registrar el aviso al administrador.');}passwordSetupMode=false;history.replaceState(null,'',location.pathname+location.search);$('passwordSetupForm').reset();showLogin();await startBoard(session.user);toast('Contraseña guardada. Ya ingresaste al tablero.');};
     $('signOutBtn').onclick=async()=>{await client.auth.signOut();};
     $('backupBtn').onclick=async()=>{try{await exportBackup();}catch(e){toast(`No se pudo exportar: ${e.message}`);}};
     $('importBtn').onclick=()=>$('importFile').click();
     $('importFile').onchange=async e=>{if(!e.target.files?.[0])return;try{await importBackup(e.target.files[0]);}catch(err){toast(`No se pudo importar: ${err.message}`);}e.target.value='';};
-    client.auth.onAuthStateChange(async(_event,newSession)=>{session=newSession;if(!session){setLoggedOut();return;}setLoggedIn(session.user);try{await loadBoard();if(channel)await client.removeChannel(channel);channel=client.channel('gauss-board-live').on('postgres_changes',{event:'*',schema:'public',table:'requests'},()=>loadBoard()).on('postgres_changes',{event:'*',schema:'public',table:'request_updates'},()=>loadBoard()).subscribe();}catch(e){toast(`No se pudo cargar el tablero: ${e.message}`);}});
-    const {data:{session:existing}}=await client.auth.getSession();if(existing){session=existing;setLoggedIn(session.user);try{await loadBoard();channel=client.channel('gauss-board-live').on('postgres_changes',{event:'*',schema:'public',table:'requests'},()=>loadBoard()).on('postgres_changes',{event:'*',schema:'public',table:'request_updates'},()=>loadBoard()).subscribe();}catch(e){toast(`No se pudo cargar el tablero: ${e.message}`);}}
+    $('loginEmail').value=new URLSearchParams(location.hash.slice(1)).get('email')||'';
+    client.auth.onAuthStateChange(async(event,newSession)=>{session=newSession;if(!session){setLoggedOut();return;}if(passwordSetupMode||event==='PASSWORD_RECOVERY'){passwordSetupMode=true;setLoggedOut();showPasswordSetup();return;}showLogin();await startBoard(session.user);});
+    const {data:{session:existing}}=await client.auth.getSession();if(existing){session=existing;if(passwordSetupMode){setLoggedOut();showPasswordSetup();}else{showLogin();await startBoard(existing.user);}}else{showLogin();}
     $('newBtn').onclick=()=>{$('requestDate').value=new Date().toISOString().slice(0,10);$('formOverlay').classList.add('show');};
     document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>close(b.dataset.close));document.querySelectorAll('.overlay').forEach(o=>o.onclick=e=>{if(e.target===o)close(o.id);});
     $('cards').onclick=e=>{const c=e.target.closest('[data-id]');if(c)show(c.dataset.id);};$('search').oninput=render;
