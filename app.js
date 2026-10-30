@@ -49,16 +49,17 @@
   function collaboratorValue(value) {
     const key=nameKey(value);
     if(key.includes('fabriz')||key==='fberto')return 'Fabrizio Berto';
-    if(key.includes('estef')||key==='enasrala')return 'Estefanía Nasrala';
+    if(key.includes('estef')||key==='enasrala')return 'Estefania Nasrala';
     if(key.includes('alej')||key==='acorredor')return 'Alejandra Corredor';
     return '';
   }
-  function collaboratorOptions(value='') {const selected=collaboratorValue(value);return `<option value="">Sin colaborador líder</option>${collaboratorNames.map(name=>`<option value="${esc(name)}" ${selected===name?'selected':''}>${esc(name)}</option>`).join('')}`;}
+  function collaboratorOptions(value='') {const selected=collaboratorValue(value);return `<option value="" ${selected?'':'selected'} disabled>Elegí un colaborador</option>${collaboratorNames.map(name=>`<option value="${esc(name)}" ${selected===name?'selected':''}>${esc(name)}</option>`).join('')}`;}
   function displayName(value,fallback='') {
     const raw=String(value||'').trim();
     const key=nameKey(raw);
     const aliases={alejandra:'Alejandra Corredor',acorredor:'Alejandra Corredor',alejandracorredor:'Alejandra Corredor',fberto:'Fabrizio Berto',fabrizio:'Fabrizio Berto',fabrizioberto:'Fabrizio Berto',enasrala:'Estefania Nasrala',estefania:'Estefania Nasrala',estefanianasrala:'Estefania Nasrala'};
     if(aliases[key])return aliases[key];
+    if(raw.includes('@')&&nameKey(fallback)==='usuario')return 'Alejandra Corredor';
     return raw.includes('@')?(fallback||raw):(raw||fallback||'Equipo');
   }
 
